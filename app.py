@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import json
 from secret_keys import *
+import re
 
 load_dotenv()
 
@@ -30,21 +31,60 @@ def get_embedding(text, client):
     )
     return response.data[0].embedding
 
-def search_similar_blogs(conn, query_embedding, limit=10):
+def detect_personality_types(query):
+    """Detect MBTI and Enneagram types in the query."""
+    query_upper = query.upper()
+    
+    # MBTI types
+    mbti_types = ['INTJ', 'INTP', 'ENTJ', 'ENTP', 'INFJ', 'INFP', 'ENFJ', 'ENFP',
+                  'ISTJ', 'ISFJ', 'ESTJ', 'ESFJ', 'ISTP', 'ISFP', 'ESTP', 'ESFP']
+    detected_mbti = [t for t in mbti_types if t in query_upper]
+    
+    # Enneagram types (looking for "TYPE 1", "TYPE ONE", "ENNEAGRAM 1", etc.)
+    enneagram_patterns = [
+        r'TYPE\s*(\d|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE)',
+        r'ENNEAGRAM\s*(\d|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE)'
+    ]
+    detected_enneagram = []
+    for pattern in enneagram_patterns:
+        matches = re.findall(pattern, query_upper)
+        detected_enneagram.extend(matches)
+    
+    return detected_mbti, detected_enneagram
+
+def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-        cursor.execute('''
-            SELECT 
-                url,
-                title,
-                text,
-                categories,
-                date,
-                1 - (embedding <=> %s::vector) as similarity
-            FROM blogs_embeddings
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s
-        ''', (query_embedding, query_embedding, limit))
+        if type_filter:
+            # Search with type filter
+            cursor.execute('''
+                SELECT 
+                    url,
+                    title,
+                    text,
+                    categories,
+                    date,
+                    1 - (embedding <=> %s::vector) as similarity
+                FROM blogs_embeddings
+                WHERE embedding IS NOT NULL
+                AND (title ILIKE %s OR text ILIKE %s)
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            ''', (query_embedding, f'%{type_filter}%', f'%{type_filter}%', query_embedding, limit))
+        else:
+            # Regular search
+            cursor.execute('''
+                SELECT 
+                    url,
+                    title,
+                    text,
+                    categories,
+                    date,
+                    1 - (embedding <=> %s::vector) as similarity
+                FROM blogs_embeddings
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            ''', (query_embedding, query_embedding, limit))
         return cursor.fetchall()
 
 def get_stats(conn):
@@ -105,8 +145,19 @@ if st.button("Search", type="primary") and search_query:
         st.error("No embeddings available. Run generate_embeddings.py first.")
     else:
         with st.spinner("Searching..."):
+            # Detect personality types in query
+            detected_mbti, detected_enneagram = detect_personality_types(search_query)
+            
+            type_filter = None
+            if detected_mbti:
+                type_filter = detected_mbti[0]
+                st.info(f"🎯 Filtering results to include '{type_filter}' content")
+            elif detected_enneagram:
+                type_filter = f"Type {detected_enneagram[0]}" if detected_enneagram[0].isdigit() else detected_enneagram[0]
+                st.info(f"🎯 Filtering results to include '{type_filter}' content")
+            
             query_embedding = get_embedding(search_query, st.session_state.openai_client)
-            results = search_similar_blogs(st.session_state.conn, query_embedding, limit=num_results)
+            results = search_similar_blogs(st.session_state.conn, query_embedding, limit=num_results, type_filter=type_filter)
             
             if results:
                 st.success(f"Found {len(results)} most similar articles")

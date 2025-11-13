@@ -55,21 +55,32 @@ def detect_personality_types(query):
 def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
         if type_filter:
-            # Search with type filter
+            # First, filter to only blogs containing the type, THEN do semantic search on that subset
             cursor.execute('''
+                WITH filtered_blogs AS (
+                    SELECT 
+                        url,
+                        title,
+                        text,
+                        categories,
+                        date,
+                        embedding,
+                        1 - (embedding <=> %s::vector) as similarity
+                    FROM blogs_embeddings
+                    WHERE embedding IS NOT NULL
+                    AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
+                )
                 SELECT 
                     url,
                     title,
                     text,
                     categories,
                     date,
-                    1 - (embedding <=> %s::vector) as similarity
-                FROM blogs_embeddings
-                WHERE embedding IS NOT NULL
-                AND (title ILIKE %s OR text ILIKE %s)
-                ORDER BY embedding <=> %s::vector
+                    similarity
+                FROM filtered_blogs
+                ORDER BY similarity DESC
                 LIMIT %s
-            ''', (query_embedding, f'%{type_filter}%', f'%{type_filter}%', query_embedding, limit))
+            ''', (query_embedding, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', limit))
         else:
             # Regular search
             cursor.execute('''
@@ -194,4 +205,4 @@ if st.button("Search", type="primary") and search_query:
                                 except Exception as e:
                                     st.warning(f"Could not generate summary: {e}")
             else:
-                st.warning(f"No blogs found with embeddings. Please run generate_embeddings.py first.")
+                st.warning(f"No articles found matching '{type_filter}'. Try a different search.")

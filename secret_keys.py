@@ -1,0 +1,5 @@
+import streamlit as st
+
+OPENAI_API_KEY=st.secrets['OPENAI_API_KEY']
+SUPABASE_HOST=st.secrets['SUPABASE_HOST']
+SUPABASE_PASSWORD=st.secrets['SUPABASE_PASSWORD']

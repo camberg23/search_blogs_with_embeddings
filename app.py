@@ -145,7 +145,6 @@ def extract_author_from_rss(rss_content):
     return None
 
 def search_similar_blogs(query_embedding, limit=10, type_filter=None):
-    # Create fresh connection for each search
     conn = psycopg2.connect(
         host=SUPABASE_HOST,
         port="5432",
@@ -157,40 +156,49 @@ def search_similar_blogs(query_embedding, limit=10, type_filter=None):
     
     embedding_str = '[' + ','.join(str(x) for x in query_embedding) + ']'
     
+    results = []
     try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-            if type_filter:
-                query = f'''
-                    SELECT 
-                        url,
-                        title,
-                        categories,
-                        date,
-                        rss_content,
-                        1 - (embedding <=> '{embedding_str}'::vector) as similarity
-                    FROM blogs_embeddings
-                    WHERE embedding IS NOT NULL
-                    AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
-                    ORDER BY embedding <=> '{embedding_str}'::vector
-                    LIMIT {int(limit)}
-                '''
-                cursor.execute(query, (f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%'))
-            else:
-                query = f'''
-                    SELECT 
-                        url,
-                        title,
-                        categories,
-                        date,
-                        rss_content,
-                        1 - (embedding <=> '{embedding_str}'::vector) as similarity
-                    FROM blogs_embeddings
-                    WHERE embedding IS NOT NULL
-                    ORDER BY embedding <=> '{embedding_str}'::vector
-                    LIMIT {int(limit)}
-                '''
-                cursor.execute(query)
-            results = cursor.fetchall()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        if type_filter:
+            query = f'''
+                SELECT 
+                    url,
+                    title,
+                    categories,
+                    date,
+                    rss_content,
+                    1 - (embedding <=> '{embedding_str}'::vector) as similarity
+                FROM blogs_embeddings
+                WHERE embedding IS NOT NULL
+                AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
+                ORDER BY embedding <=> '{embedding_str}'::vector
+                LIMIT {int(limit)}
+            '''
+            cursor.execute(query, (f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%'))
+        else:
+            query = f'''
+                SELECT 
+                    url,
+                    title,
+                    categories,
+                    date,
+                    rss_content,
+                    1 - (embedding <=> '{embedding_str}'::vector) as similarity
+                FROM blogs_embeddings
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> '{embedding_str}'::vector
+                LIMIT {int(limit)}
+            '''
+            cursor.execute(query)
+        
+        # Fetch one by one
+        while True:
+            row = cursor.fetchone()
+            if row is None:
+                break
+            results.append(row)
+        
+        cursor.close()
     finally:
         conn.close()
     

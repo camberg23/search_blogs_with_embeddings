@@ -9,8 +9,12 @@ import json
 from secret_keys import *
 import re
 import time
+import numpy as np
 
 load_dotenv()
+
+# Register pgvector types with psycopg2
+from pgvector.psycopg2 import register_vector
 
 st.set_page_config(page_title="Truity Blog Search", page_icon="🔍", layout="wide")
 
@@ -23,6 +27,7 @@ def create_connection():
         dbname="postgres",
         sslmode="require"
     )
+    register_vector(conn)
     return conn
 
 def get_embedding(text, client):
@@ -63,7 +68,7 @@ def insert_blog_with_embedding(conn, blog_data, embedding):
             blog_data['title'],
             blog_data['text'],
             blog_data['date'],
-            embedding
+            np.array(embedding)
         ))
     conn.commit()
 
@@ -109,12 +114,10 @@ def detect_personality_types(query):
     """Detect MBTI and Enneagram types in the query."""
     query_upper = query.upper()
     
-    # MBTI types
     mbti_types = ['INTJ', 'INTP', 'ENTJ', 'ENTP', 'INFJ', 'INFP', 'ENFJ', 'ENFP',
                   'ISTJ', 'ISFJ', 'ESTJ', 'ESFJ', 'ISTP', 'ISFP', 'ESTP', 'ESFP']
     detected_mbti = [t for t in mbti_types if t in query_upper]
     
-    # Enneagram types (looking for "TYPE 1", "TYPE ONE", "ENNEAGRAM 1", etc.)
     enneagram_patterns = [
         r'TYPE\s*(\d|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE)',
         r'ENNEAGRAM\s*(\d|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE)'
@@ -131,17 +134,14 @@ def extract_author_from_rss(rss_content):
     if not rss_content:
         return None
     
-    # Try to find author in dc:creator tag
     match = re.search(r'<dc:creator><!\[CDATA\[(.*?)\]\]></dc:creator>', rss_content)
     if match:
         return match.group(1)
     
-    # Try plain dc:creator
     match = re.search(r'<dc:creator>(.*?)</dc:creator>', rss_content)
     if match:
         return match.group(1)
     
-    # Try author tag
     match = re.search(r'<author>(.*?)</author>', rss_content)
     if match:
         return match.group(1)
@@ -150,8 +150,8 @@ def extract_author_from_rss(rss_content):
 
 def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-        # Convert embedding list to string format for PostgreSQL
-        embedding_str = '[' + ','.join(str(x) for x in query_embedding) + ']'
+        # Convert to numpy array for pgvector
+        embedding_array = np.array(query_embedding)
         
         if type_filter:
             cursor.execute('''
@@ -162,13 +162,13 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     categories,
                     date,
                     rss_content,
-                    1 - (embedding <=> %s::vector) as similarity
+                    1 - (embedding <=> %s) as similarity
                 FROM blogs_embeddings
                 WHERE embedding IS NOT NULL
                 AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
-                ORDER BY embedding <=> %s::vector
+                ORDER BY embedding <=> %s
                 LIMIT %s
-            ''', (embedding_str, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', embedding_str, limit))
+            ''', (embedding_array, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', embedding_array, limit))
         else:
             cursor.execute('''
                 SELECT 
@@ -178,12 +178,12 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     categories,
                     date,
                     rss_content,
-                    1 - (embedding <=> %s::vector) as similarity
+                    1 - (embedding <=> %s) as similarity
                 FROM blogs_embeddings
                 WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector
+                ORDER BY embedding <=> %s
                 LIMIT %s
-            ''', (embedding_str, embedding_str, limit))
+            ''', (embedding_array, embedding_array, limit))
         return cursor.fetchall()
 
 def get_stats(conn):
@@ -283,54 +283,12 @@ with col2:
 with col3:
     show_gap_analysis = st.checkbox("Show content gaps", value=False)
 
-# Debug section
-with st.expander("🔧 Debug Info", expanded=False):
-    if st.button("Test DB Query"):
-        try:
-            with st.session_state.conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("SELECT COUNT(*) as cnt FROM blogs_embeddings WHERE embedding IS NOT NULL")
-                count = cursor.fetchone()
-                st.write(f"Blogs with embeddings: {count['cnt']}")
-                
-                cursor.execute("SELECT url, title FROM blogs_embeddings WHERE embedding IS NOT NULL LIMIT 5")
-                sample = cursor.fetchall()
-                st.write("Sample blogs:")
-                for s in sample:
-                    st.write(f"- {s['title']}")
-        except Exception as e:
-            st.error(f"DB Error: {e}")
-    
-    if st.button("Test Vector Search Raw"):
-        try:
-            # Get a real embedding from the database
-            with st.session_state.conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("SELECT title, embedding FROM blogs_embeddings WHERE embedding IS NOT NULL LIMIT 1")
-                sample = cursor.fetchone()
-                st.write(f"Using embedding from: {sample['title']}")
-                
-                # Use that embedding to search
-                cursor.execute('''
-                    SELECT title, 1 - (embedding <=> %s) as similarity
-                    FROM blogs_embeddings
-                    WHERE embedding IS NOT NULL
-                    ORDER BY embedding <=> %s
-                    LIMIT 6
-                ''', (sample['embedding'], sample['embedding']))
-                
-                results = cursor.fetchall()
-                st.write(f"Raw vector search returned {len(results)} results:")
-                for r in results:
-                    st.write(f"- {r['title']} ({r['similarity']:.2%})")
-        except Exception as e:
-            st.error(f"Vector search error: {e}")
-
 if st.button("Search", type="primary") and search_query:
     stats = get_stats(st.session_state.conn)
     if stats['blogs_with_embeddings'] == 0:
         st.error("No embeddings available.")
     else:
         with st.spinner("Searching..."):
-            # Detect personality types in query
             detected_mbti, detected_enneagram = detect_personality_types(search_query)
             
             type_filter = None
@@ -342,14 +300,7 @@ if st.button("Search", type="primary") and search_query:
                 st.info(f"🎯 Filtering results to include '{type_filter}' content")
             
             query_embedding = get_embedding(search_query, st.session_state.openai_client)
-            
-            # Debug: show embedding info
-            st.caption(f"Debug: Embedding length = {len(query_embedding)}, first 3 values = {query_embedding[:3]}")
-            
             results = search_similar_blogs(st.session_state.conn, query_embedding, limit=num_results, type_filter=type_filter)
-            
-            # Debug info
-            st.caption(f"Debug: Query returned {len(results)} results, limit was {num_results}, type_filter was '{type_filter}'")
             
             if results:
                 st.success(f"Showing {len(results)} most similar articles")
@@ -391,7 +342,6 @@ if st.button("Search", type="primary") and search_query:
                                 except Exception as e:
                                     st.warning(f"Could not generate summary: {e}")
                 
-                # Gap Analysis Section
                 if show_gap_analysis:
                     st.divider()
                     st.subheader("💡 Suggested Topics We Haven't Covered Yet")
@@ -402,4 +352,4 @@ if st.button("Search", type="primary") and search_query:
                         except Exception as e:
                             st.warning(f"Could not generate gap analysis: {e}")
             else:
-                st.warning(f"No articles found matching '{type_filter}'. Try a different search.")
+                st.warning(f"No articles found. Try a different search.")

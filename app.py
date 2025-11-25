@@ -151,22 +151,8 @@ def extract_author_from_rss(rss_content):
 def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
         if type_filter:
-            # First, filter to only blogs containing the type, THEN do semantic search on that subset
+            # First filter by type, then rank by similarity
             cursor.execute('''
-                WITH filtered_blogs AS (
-                    SELECT 
-                        url,
-                        title,
-                        text,
-                        categories,
-                        date,
-                        rss_content,
-                        embedding,
-                        1 - (embedding <=> %s::vector) as similarity
-                    FROM blogs_embeddings
-                    WHERE embedding IS NOT NULL
-                    AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
-                )
                 SELECT 
                     url,
                     title,
@@ -174,11 +160,13 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     categories,
                     date,
                     rss_content,
-                    similarity
-                FROM filtered_blogs
-                ORDER BY similarity DESC
+                    1 - (embedding <=> %s::vector) as similarity
+                FROM blogs_embeddings
+                WHERE embedding IS NOT NULL
+                AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
+                ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            ''', (query_embedding, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', limit))
+            ''', (query_embedding, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', query_embedding, limit))
         else:
             # Regular search - always return N closest results
             cursor.execute('''
@@ -278,7 +266,7 @@ with st.sidebar:
     st.markdown("• Use complete phrases or sentences")
     st.markdown("• Example: *'mindfulness meditation techniques for anxiety'* is better than just *'meditation'*")
 
-st.header("Search")
+st.title("Search")
 
 search_query = st.text_input(
     "Describe what you're looking for (be specific for best results)",
@@ -313,6 +301,9 @@ if st.button("Search", type="primary") and search_query:
             
             query_embedding = get_embedding(search_query, st.session_state.openai_client)
             results = search_similar_blogs(st.session_state.conn, query_embedding, limit=num_results, type_filter=type_filter)
+            
+            # Debug info
+            st.caption(f"Debug: Query returned {len(results)} results, limit was {num_results}, type_filter was '{type_filter}'")
             
             if results:
                 st.success(f"Showing {len(results)} most similar articles")

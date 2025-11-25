@@ -150,8 +150,10 @@ def extract_author_from_rss(rss_content):
 
 def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        # Convert embedding list to string format for PostgreSQL
+        embedding_str = '[' + ','.join(str(x) for x in query_embedding) + ']'
+        
         if type_filter:
-            # First filter by type, then rank by similarity
             cursor.execute('''
                 SELECT 
                     url,
@@ -166,9 +168,8 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                 AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            ''', (query_embedding, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', query_embedding, limit))
+            ''', (embedding_str, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', embedding_str, limit))
         else:
-            # Regular search - always return N closest results
             cursor.execute('''
                 SELECT 
                     url,
@@ -182,7 +183,7 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                 WHERE embedding IS NOT NULL
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            ''', (query_embedding, query_embedding, limit))
+            ''', (embedding_str, embedding_str, limit))
         return cursor.fetchall()
 
 def get_stats(conn):
@@ -266,7 +267,7 @@ with st.sidebar:
     st.markdown("• Use complete phrases or sentences")
     st.markdown("• Example: *'mindfulness meditation techniques for anxiety'* is better than just *'meditation'*")
 
-st.title("Search")
+st.header("Search")
 
 search_query = st.text_input(
     "Describe what you're looking for (be specific for best results)",
@@ -281,6 +282,23 @@ with col2:
     show_summaries = st.checkbox("Generate summaries", value=False)
 with col3:
     show_gap_analysis = st.checkbox("Show content gaps", value=False)
+
+# Debug section
+with st.expander("🔧 Debug Info", expanded=False):
+    if st.button("Test DB Query"):
+        try:
+            with st.session_state.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("SELECT COUNT(*) as cnt FROM blogs_embeddings WHERE embedding IS NOT NULL")
+                count = cursor.fetchone()
+                st.write(f"Blogs with embeddings: {count['cnt']}")
+                
+                cursor.execute("SELECT url, title FROM blogs_embeddings WHERE embedding IS NOT NULL LIMIT 5")
+                sample = cursor.fetchall()
+                st.write("Sample blogs:")
+                for s in sample:
+                    st.write(f"- {s['title']}")
+        except Exception as e:
+            st.error(f"DB Error: {e}")
 
 if st.button("Search", type="primary") and search_query:
     stats = get_stats(st.session_state.conn)
@@ -300,6 +318,10 @@ if st.button("Search", type="primary") and search_query:
                 st.info(f"🎯 Filtering results to include '{type_filter}' content")
             
             query_embedding = get_embedding(search_query, st.session_state.openai_client)
+            
+            # Debug: show embedding info
+            st.caption(f"Debug: Embedding length = {len(query_embedding)}, first 3 values = {query_embedding[:3]}")
+            
             results = search_similar_blogs(st.session_state.conn, query_embedding, limit=num_results, type_filter=type_filter)
             
             # Debug info

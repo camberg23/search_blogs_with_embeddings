@@ -351,4 +351,3 @@ if st.button("Search", type="primary") and search_query:
                             st.warning(f"Could not generate gap analysis: {e}")
             else:
                 st.warning(f"No articles found. Try a different search.")
-openai

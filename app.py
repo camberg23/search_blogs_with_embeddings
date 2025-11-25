@@ -8,6 +8,7 @@ from openai import OpenAI
 import json
 from secret_keys import *
 import re
+import time
 
 load_dotenv()
 
@@ -31,6 +32,79 @@ def get_embedding(text, client):
     )
     return response.data[0].embedding
 
+def get_blogs_needing_embeddings(conn):
+    """Get blogs that need embeddings."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        cursor.execute('''
+            SELECT b.url, b.title, b.text, b.categories, b.rss_content, b.date
+            FROM blogs b
+            LEFT JOIN blogs_embeddings be ON b.url = be.url
+            WHERE be.url IS NULL OR be.embedding IS NULL
+        ''')
+        return cursor.fetchall()
+
+def insert_blog_with_embedding(conn, blog_data, embedding):
+    """Insert or update a blog in blogs_embeddings with its embedding."""
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            INSERT INTO blogs_embeddings (url, rss_content, categories, title, text, date, embedding)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (url) DO UPDATE SET
+                rss_content = EXCLUDED.rss_content,
+                categories = EXCLUDED.categories,
+                title = EXCLUDED.title,
+                text = EXCLUDED.text,
+                date = EXCLUDED.date,
+                embedding = EXCLUDED.embedding
+        ''', (
+            blog_data['url'],
+            blog_data['rss_content'],
+            blog_data['categories'],
+            blog_data['title'],
+            blog_data['text'],
+            blog_data['date'],
+            embedding
+        ))
+    conn.commit()
+
+def sync_embeddings(conn, client):
+    """Check for new blogs and generate embeddings if needed."""
+    blogs_needing_embeddings = get_blogs_needing_embeddings(conn)
+    
+    if not blogs_needing_embeddings:
+        return 0
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    successful = 0
+    for idx, blog in enumerate(blogs_needing_embeddings):
+        try:
+            status_text.text(f"Generating embeddings... ({idx + 1}/{len(blogs_needing_embeddings)})")
+            
+            text_to_embed = f"{blog['title']}\n\n{blog['text']}"
+            max_chars = 8000
+            if len(text_to_embed) > max_chars:
+                text_to_embed = text_to_embed[:max_chars]
+            
+            embedding = get_embedding(text_to_embed, client)
+            insert_blog_with_embedding(conn, blog, embedding)
+            
+            successful += 1
+            progress_bar.progress((idx + 1) / len(blogs_needing_embeddings))
+            
+            if idx < len(blogs_needing_embeddings) - 1:
+                time.sleep(0.2)
+                
+        except Exception as e:
+            st.error(f"Failed to process '{blog['title'][:50]}...': {e}")
+            continue
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    return successful
+
 def detect_personality_types(query):
     """Detect MBTI and Enneagram types in the query."""
     query_upper = query.upper()
@@ -52,6 +126,28 @@ def detect_personality_types(query):
     
     return detected_mbti, detected_enneagram
 
+def extract_author_from_rss(rss_content):
+    """Extract author name from RSS content."""
+    if not rss_content:
+        return None
+    
+    # Try to find author in dc:creator tag
+    match = re.search(r'<dc:creator><!\[CDATA\[(.*?)\]\]></dc:creator>', rss_content)
+    if match:
+        return match.group(1)
+    
+    # Try plain dc:creator
+    match = re.search(r'<dc:creator>(.*?)</dc:creator>', rss_content)
+    if match:
+        return match.group(1)
+    
+    # Try author tag
+    match = re.search(r'<author>(.*?)</author>', rss_content)
+    if match:
+        return match.group(1)
+    
+    return None
+
 def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
         if type_filter:
@@ -64,6 +160,7 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                         text,
                         categories,
                         date,
+                        rss_content,
                         embedding,
                         1 - (embedding <=> %s::vector) as similarity
                     FROM blogs_embeddings
@@ -76,13 +173,14 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     text,
                     categories,
                     date,
+                    rss_content,
                     similarity
                 FROM filtered_blogs
                 ORDER BY similarity DESC
                 LIMIT %s
             ''', (query_embedding, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', limit))
         else:
-            # Regular search
+            # Regular search - always return N closest results
             cursor.execute('''
                 SELECT 
                     url,
@@ -90,6 +188,7 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     text,
                     categories,
                     date,
+                    rss_content,
                     1 - (embedding <=> %s::vector) as similarity
                 FROM blogs_embeddings
                 WHERE embedding IS NOT NULL
@@ -108,10 +207,53 @@ def get_stats(conn):
         ''')
         return cursor.fetchone()
 
+def generate_gap_analysis(client, search_query, results):
+    """Generate content gap analysis and new article ideas."""
+    existing_titles = [r['title'] for r in results]
+    existing_titles_str = "\n".join(f"- {t}" for t in existing_titles)
+    
+    prompt = f"""Based on the search query "{search_query}", here are the existing blog articles we have:
+
+{existing_titles_str}
+
+Please suggest 4-6 new article ideas that would fill gaps in our content coverage for this topic. These should be topics we haven't covered yet but would be valuable for readers interested in "{search_query}".
+
+Format each suggestion as a potential article title, with a brief (1 sentence) explanation of why it would be valuable.
+
+Focus on:
+- Angles we haven't explored
+- Related subtopics missing from our coverage
+- Fresh perspectives on the topic
+- Practical applications we haven't addressed"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a content strategist helping identify gaps in a personality psychology blog's content. Suggest practical, engaging article ideas that would complement existing coverage."},
+            {"role": "user", "content": prompt}
+        ],
+    )
+    
+    return response.choices[0].message.content
+
+# Initialize connection and client
 if 'conn' not in st.session_state:
     st.session_state.conn = create_connection()
 if 'openai_client' not in st.session_state:
     st.session_state.openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Auto-sync embeddings on app load
+if 'embeddings_synced' not in st.session_state:
+    with st.spinner("Checking for new blogs..."):
+        blogs_needing_embeddings = get_blogs_needing_embeddings(st.session_state.conn)
+        if blogs_needing_embeddings:
+            st.info(f"Found {len(blogs_needing_embeddings)} new blogs. Generating embeddings...")
+            synced_count = sync_embeddings(st.session_state.conn, st.session_state.openai_client)
+            if synced_count > 0:
+                st.success(f"✅ Generated embeddings for {synced_count} new blogs!")
+                time.sleep(2)
+                st.rerun()
+    st.session_state.embeddings_synced = True
 
 st.title("🔍 Truity Blog Search")
 st.markdown("**Semantic search** finds blog content by meaning, not keywords. The more specific your query, the better the results.")
@@ -126,7 +268,7 @@ with st.sidebar:
         st.metric("With Embeddings", stats['blogs_with_embeddings'])
     
     if stats['blogs_with_embeddings'] == 0:
-        st.warning("No embeddings yet. Run generate_embeddings.py first!")
+        st.warning("No embeddings yet!")
     else:
         st.success(f"{stats['blogs_with_embeddings']} blogs searchable")
     
@@ -144,16 +286,18 @@ search_query = st.text_input(
     key="search_input"
 )
 
-col1, col2 = st.columns([3, 1])
+col1, col2, col3 = st.columns([2, 1, 1])
 with col1:
     num_results = st.slider("Number of results", 1, 20, 10)
 with col2:
     show_summaries = st.checkbox("Generate summaries", value=False)
+with col3:
+    show_gap_analysis = st.checkbox("Show content gaps", value=False)
 
 if st.button("Search", type="primary") and search_query:
     stats = get_stats(st.session_state.conn)
     if stats['blogs_with_embeddings'] == 0:
-        st.error("No embeddings available. Run generate_embeddings.py first.")
+        st.error("No embeddings available.")
     else:
         with st.spinner("Searching..."):
             # Detect personality types in query
@@ -171,16 +315,21 @@ if st.button("Search", type="primary") and search_query:
             results = search_similar_blogs(st.session_state.conn, query_embedding, limit=num_results, type_filter=type_filter)
             
             if results:
-                st.success(f"Found {len(results)} most similar articles")
+                st.success(f"Showing {len(results)} most similar articles")
                 
                 for idx, result in enumerate(results, 1):
+                    author = extract_author_from_rss(result.get('rss_content'))
+                    
                     with st.expander(f"**{idx}. {result['title']}**", expanded=True):
-                        col1, col2 = st.columns([2, 1])
+                        col1, col2, col3 = st.columns([2, 1, 1])
                         with col1:
                             st.markdown(f"**Similarity Score:** {result['similarity']:.1%}")
                         with col2:
                             if result['date']:
                                 st.markdown(f"**Date:** {result['date']}")
+                        with col3:
+                            if author:
+                                st.markdown(f"**Author:** {author}")
                         
                         st.markdown(f"[View Article →]({result['url']})")
                         
@@ -204,5 +353,16 @@ if st.button("Search", type="primary") and search_query:
                                     st.markdown(f"**Summary:** {summary_response.choices[0].message.content}")
                                 except Exception as e:
                                     st.warning(f"Could not generate summary: {e}")
+                
+                # Gap Analysis Section
+                if show_gap_analysis:
+                    st.divider()
+                    st.subheader("💡 Suggested Topics We Haven't Covered Yet")
+                    with st.spinner("Analyzing content gaps..."):
+                        try:
+                            gap_ideas = generate_gap_analysis(st.session_state.openai_client, search_query, results)
+                            st.markdown(gap_ideas)
+                        except Exception as e:
+                            st.warning(f"Could not generate gap analysis: {e}")
             else:
                 st.warning(f"No articles found matching '{type_filter}'. Try a different search.")

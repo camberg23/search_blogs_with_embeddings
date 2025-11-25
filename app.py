@@ -299,6 +299,30 @@ with st.expander("🔧 Debug Info", expanded=False):
                     st.write(f"- {s['title']}")
         except Exception as e:
             st.error(f"DB Error: {e}")
+    
+    if st.button("Test Vector Search Raw"):
+        try:
+            # Get a real embedding from the database
+            with st.session_state.conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("SELECT title, embedding FROM blogs_embeddings WHERE embedding IS NOT NULL LIMIT 1")
+                sample = cursor.fetchone()
+                st.write(f"Using embedding from: {sample['title']}")
+                
+                # Use that embedding to search
+                cursor.execute('''
+                    SELECT title, 1 - (embedding <=> %s) as similarity
+                    FROM blogs_embeddings
+                    WHERE embedding IS NOT NULL
+                    ORDER BY embedding <=> %s
+                    LIMIT 6
+                ''', (sample['embedding'], sample['embedding']))
+                
+                results = cursor.fetchall()
+                st.write(f"Raw vector search returned {len(results)} results:")
+                for r in results:
+                    st.write(f"- {r['title']} ({r['similarity']:.2%})")
+        except Exception as e:
+            st.error(f"Vector search error: {e}")
 
 if st.button("Search", type="primary") and search_query:
     stats = get_stats(st.session_state.conn)

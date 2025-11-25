@@ -9,12 +9,8 @@ import json
 from secret_keys import *
 import re
 import time
-import numpy as np
 
 load_dotenv()
-
-# Register pgvector types with psycopg2
-from pgvector.psycopg2 import register_vector
 
 st.set_page_config(page_title="Truity Blog Search", page_icon="🔍", layout="wide")
 
@@ -27,7 +23,6 @@ def create_connection():
         dbname="postgres",
         sslmode="require"
     )
-    register_vector(conn)
     return conn
 
 def get_embedding(text, client):
@@ -50,10 +45,11 @@ def get_blogs_needing_embeddings(conn):
 
 def insert_blog_with_embedding(conn, blog_data, embedding):
     """Insert or update a blog in blogs_embeddings with its embedding."""
+    embedding_str = '[' + ','.join(str(x) for x in embedding) + ']'
     with conn.cursor() as cursor:
         cursor.execute('''
             INSERT INTO blogs_embeddings (url, rss_content, categories, title, text, date, embedding)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
             ON CONFLICT (url) DO UPDATE SET
                 rss_content = EXCLUDED.rss_content,
                 categories = EXCLUDED.categories,
@@ -68,7 +64,7 @@ def insert_blog_with_embedding(conn, blog_data, embedding):
             blog_data['title'],
             blog_data['text'],
             blog_data['date'],
-            np.array(embedding)
+            embedding_str
         ))
     conn.commit()
 
@@ -149,12 +145,12 @@ def extract_author_from_rss(rss_content):
     return None
 
 def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
+    # Convert embedding to PostgreSQL vector string format
+    embedding_str = '[' + ','.join(str(x) for x in query_embedding) + ']'
+    
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-        # Convert to numpy array for pgvector
-        embedding_array = np.array(query_embedding)
-        
         if type_filter:
-            cursor.execute('''
+            query = f'''
                 SELECT 
                     url,
                     title,
@@ -162,15 +158,16 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     categories,
                     date,
                     rss_content,
-                    1 - (embedding <=> %s) as similarity
+                    1 - (embedding <=> '{embedding_str}'::vector) as similarity
                 FROM blogs_embeddings
                 WHERE embedding IS NOT NULL
                 AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
-                ORDER BY embedding <=> %s
-                LIMIT %s
-            ''', (embedding_array, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%', embedding_array, limit))
+                ORDER BY embedding <=> '{embedding_str}'::vector
+                LIMIT {int(limit)}
+            '''
+            cursor.execute(query, (f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%'))
         else:
-            cursor.execute('''
+            query = f'''
                 SELECT 
                     url,
                     title,
@@ -178,12 +175,13 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     categories,
                     date,
                     rss_content,
-                    1 - (embedding <=> %s) as similarity
+                    1 - (embedding <=> '{embedding_str}'::vector) as similarity
                 FROM blogs_embeddings
                 WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> %s
-                LIMIT %s
-            ''', (embedding_array, embedding_array, limit))
+                ORDER BY embedding <=> '{embedding_str}'::vector
+                LIMIT {int(limit)}
+            '''
+            cursor.execute(query)
         return cursor.fetchall()
 
 def get_stats(conn):
@@ -353,3 +351,4 @@ if st.button("Search", type="primary") and search_query:
                             st.warning(f"Could not generate gap analysis: {e}")
             else:
                 st.warning(f"No articles found. Try a different search.")
+openai

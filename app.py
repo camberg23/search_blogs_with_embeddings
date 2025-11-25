@@ -139,6 +139,8 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
     embedding_str = '[' + ','.join(f'{x:.8f}' for x in query_embedding) + ']'
     
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        cursor.execute("SET enable_indexscan = off")
+        cursor.execute("SET enable_bitmapscan = off")
         if type_filter:
             query = f'''
                 SELECT 

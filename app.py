@@ -4,10 +4,11 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 from secret_keys import *
+import time
 
 st.set_page_config(page_title="Truity Blog Search", page_icon="🔍", layout="wide")
 
-st.title("🔍 Debug: Embedding Format Investigation")
+st.title("🔍 Debug: Timeout Investigation")
 
 # Connect
 conn = psycopg2.connect(
@@ -24,78 +25,124 @@ st.success("✅ Connected")
 client = OpenAI(api_key=OPENAI_API_KEY)
 response = client.embeddings.create(input="test query", model="text-embedding-3-small")
 openai_embedding = response.data[0].embedding
-st.write(f"OpenAI embedding type: {type(openai_embedding)}")
-st.write(f"OpenAI embedding[0] type: {type(openai_embedding[0])}")
 
-# Get a DB embedding for comparison
-cursor = conn.cursor()
-cursor.execute("SELECT embedding::text FROM blogs_embeddings WHERE embedding IS NOT NULL LIMIT 1")
-db_embedding_str = cursor.fetchone()[0]
-cursor.close()
-st.write(f"DB embedding string length: {len(db_embedding_str)}")
-st.write(f"DB embedding starts with: {db_embedding_str[:100]}")
-
-# Test different string formats
-st.header("Testing Different String Formats")
+# Format with fewer decimals like DB does
+embedding_str = '[' + ','.join(f'{x:.8f}' for x in openai_embedding) + ']'
+st.write(f"Embedding string length: {len(embedding_str)}")
 
 test_limit = 10
 
-# Format 1: Current approach
-format1 = '[' + ','.join(str(x) for x in openai_embedding) + ']'
-st.write(f"Format 1 (str): {format1[:80]}...")
+# Test 1: Check statement timeout setting
+st.header("Test 1: Check timeout settings")
+cursor = conn.cursor()
+cursor.execute("SHOW statement_timeout")
+st.write(f"statement_timeout: {cursor.fetchone()[0]}")
+cursor.close()
 
-# Format 2: repr
-format2 = '[' + ','.join(repr(x) for x in openai_embedding) + ']'
-st.write(f"Format 2 (repr): {format2[:80]}...")
-
-# Format 3: Fixed precision
-format3 = '[' + ','.join(f'{x:.10f}' for x in openai_embedding) + ']'
-st.write(f"Format 3 (fixed 10): {format3[:80]}...")
-
-# Format 4: Scientific notation avoided
-format4 = '[' + ','.join(f'{x:.15g}' for x in openai_embedding) + ']'
-st.write(f"Format 4 (15g): {format4[:80]}...")
-
-# Test each format
-formats = [
-    ("str(x)", format1),
-    ("repr(x)", format2),
-    (".10f", format3),
-    (".15g", format4),
-]
-
-for name, emb_str in formats:
-    try:
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        query = f"""
-            SELECT url, title
-            FROM blogs_embeddings
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> '{emb_str}'::vector
-            LIMIT {test_limit}
-        """
-        cursor.execute(query)
-        results = cursor.fetchall()
-        cursor.close()
-        
-        if len(results) == test_limit:
-            st.success(f"✅ Format '{name}': {len(results)} rows")
-        else:
-            st.error(f"❌ Format '{name}': {len(results)} rows (expected {test_limit})")
-    except Exception as e:
-        st.error(f"❌ Format '{name}' failed: {e}")
-
-# Also test: what if we insert the OpenAI embedding and read it back?
-st.header("Test: Round-trip through DB")
+# Test 2: Set no timeout and try
+st.header("Test 2: Disable timeout")
 try:
-    cursor = conn.cursor()
-    # Insert into a temp check
-    cursor.execute(f"SELECT '{format1}'::vector")
-    result = cursor.fetchone()
-    st.write(f"Cast result type: {type(result[0])}")
-    st.write(f"Cast result: {str(result[0])[:100]}...")
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SET statement_timeout = 0")
+    cursor.execute("SET lock_timeout = 0")
+    
+    query = f"""
+        SELECT url, title
+        FROM blogs_embeddings
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <=> '{embedding_str}'::vector
+        LIMIT {test_limit}
+    """
+    
+    start = time.time()
+    cursor.execute(query)
+    exec_time = time.time() - start
+    st.write(f"Query execution time: {exec_time:.3f}s")
+    
+    results = cursor.fetchall()
+    st.write(f"Results: {len(results)} rows")
     cursor.close()
 except Exception as e:
-    st.error(f"Cast test failed: {e}")
+    st.error(f"Failed: {e}")
+
+# Test 3: Use server-side cursor
+st.header("Test 3: Server-side cursor")
+try:
+    cursor = conn.cursor('server_side_cursor', cursor_factory=RealDictCursor)
+    
+    query = f"""
+        SELECT url, title
+        FROM blogs_embeddings
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <=> '{embedding_str}'::vector
+        LIMIT {test_limit}
+    """
+    
+    cursor.execute(query)
+    results = cursor.fetchall()
+    st.write(f"Server-side cursor results: {len(results)} rows")
+    cursor.close()
+except Exception as e:
+    st.error(f"Failed: {e}")
+
+# Test 4: Direct connection (bypass pooler)
+st.header("Test 4: Direct connection (port 5432 vs 6543)")
+# Supabase pooler is usually on 6543, direct on 5432
+# You're already on 5432, so let's try the transaction pooler
+try:
+    conn2 = psycopg2.connect(
+        host=SUPABASE_HOST.replace("pooler", "db"),  # Try direct host
+        port="5432",
+        user="postgres.unspmmribsqbeuzhenmv",
+        password=SUPABASE_PASSWORD,
+        dbname="postgres",
+        sslmode="require"
+    )
+    cursor = conn2.cursor(cursor_factory=RealDictCursor)
+    
+    query = f"""
+        SELECT url, title
+        FROM blogs_embeddings
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <=> '{embedding_str}'::vector
+        LIMIT {test_limit}
+    """
+    
+    cursor.execute(query)
+    results = cursor.fetchall()
+    st.write(f"Direct connection results: {len(results)} rows")
+    cursor.close()
+    conn2.close()
+except Exception as e:
+    st.write(f"Direct connection failed (expected if host doesn't exist): {e}")
+
+# Test 5: Fetch one at a time
+st.header("Test 5: Fetch rows one at a time")
+try:
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    query = f"""
+        SELECT url, title
+        FROM blogs_embeddings
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <=> '{embedding_str}'::vector
+        LIMIT {test_limit}
+    """
+    
+    cursor.execute(query)
+    
+    rows = []
+    for i in range(test_limit + 5):  # Try to fetch more than limit
+        row = cursor.fetchone()
+        if row is None:
+            st.write(f"fetchone() returned None at iteration {i}")
+            break
+        rows.append(row)
+        st.write(f"Row {i}: {row['title'][:50]}...")
+    
+    st.write(f"Total fetched: {len(rows)}")
+    cursor.close()
+except Exception as e:
+    st.error(f"Failed: {e}")
 
 conn.close()

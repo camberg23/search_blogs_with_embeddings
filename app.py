@@ -135,14 +135,56 @@ def extract_author_from_rss(rss_content):
     
     return None
 
-def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
+def hybrid_search(conn, search_query, query_embedding, limit=10, type_filter=None):
+    """
+    Hybrid search combining keyword matching and semantic similarity.
+    Keyword matches are prioritized, then semantic matches fill the rest.
+    """
     embedding_str = '[' + ','.join(f'{x:.8f}' for x in query_embedding) + ']'
+    
+    # Step 1: Get keyword matches (exact phrase in title or text)
+    keyword_results = []
+    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        cursor.execute("SET enable_indexscan = off")
+        cursor.execute("SET enable_bitmapscan = off")
+        
+        keyword_query = '''
+            SELECT 
+                url,
+                title,
+                text,
+                categories,
+                date,
+                rss_content,
+                1.0 as similarity,
+                'keyword' as match_type
+            FROM blogs_embeddings
+            WHERE embedding IS NOT NULL
+            AND (title ILIKE %s OR text ILIKE %s)
+        '''
+        
+        params = [f'%{search_query}%', f'%{search_query}%']
+        
+        if type_filter:
+            keyword_query += ' AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)'
+            params.extend([f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%'])
+        
+        keyword_query += ' ORDER BY date DESC LIMIT %s'
+        params.append(limit)
+        
+        cursor.execute(keyword_query, params)
+        keyword_results = cursor.fetchall()
+    
+    # Step 2: Get semantic matches
+    semantic_results = []
+    urls_to_exclude = [r['url'] for r in keyword_results]
     
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
         cursor.execute("SET enable_indexscan = off")
         cursor.execute("SET enable_bitmapscan = off")
+        
         if type_filter:
-            query = f'''
+            semantic_query = f'''
                 SELECT 
                     url,
                     title,
@@ -150,16 +192,18 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     categories,
                     date,
                     rss_content,
-                    1 - (embedding <=> '{embedding_str}'::vector) as similarity
+                    1 - (embedding <=> '{embedding_str}'::vector) as similarity,
+                    'semantic' as match_type
                 FROM blogs_embeddings
                 WHERE embedding IS NOT NULL
+                AND url != ALL(%s)
                 AND (title ILIKE %s OR text ILIKE %s OR categories ILIKE %s)
                 ORDER BY embedding <=> '{embedding_str}'::vector
                 LIMIT {int(limit)}
             '''
-            cursor.execute(query, (f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%'))
+            cursor.execute(semantic_query, (urls_to_exclude, f'%{type_filter}%', f'%{type_filter}%', f'%{type_filter}%'))
         else:
-            query = f'''
+            semantic_query = f'''
                 SELECT 
                     url,
                     title,
@@ -167,14 +211,23 @@ def search_similar_blogs(conn, query_embedding, limit=10, type_filter=None):
                     categories,
                     date,
                     rss_content,
-                    1 - (embedding <=> '{embedding_str}'::vector) as similarity
+                    1 - (embedding <=> '{embedding_str}'::vector) as similarity,
+                    'semantic' as match_type
                 FROM blogs_embeddings
                 WHERE embedding IS NOT NULL
+                AND url != ALL(%s)
                 ORDER BY embedding <=> '{embedding_str}'::vector
                 LIMIT {int(limit)}
             '''
-            cursor.execute(query)
-        return cursor.fetchall()
+            cursor.execute(semantic_query, (urls_to_exclude,))
+        
+        semantic_results = cursor.fetchall()
+    
+    # Step 3: Combine results (keyword matches first, then semantic)
+    combined_results = keyword_results + semantic_results
+    
+    # Limit to requested number
+    return combined_results[:limit]
 
 def get_stats(conn):
     with conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -234,7 +287,7 @@ if 'embeddings_synced' not in st.session_state:
     st.session_state.embeddings_synced = True
 
 st.title("🔍 Truity Blog Search")
-st.markdown("**Semantic search** finds blog content by meaning, not keywords. The more specific your query, the better the results.")
+st.markdown("**Hybrid search** combines keyword matching with semantic search for comprehensive results.")
 
 with st.sidebar:
     st.header("📊 Database Status")
@@ -251,16 +304,16 @@ with st.sidebar:
         st.success(f"{stats['blogs_with_embeddings']} blogs searchable")
     
     st.divider()
-    st.markdown("**💡 Search Tips:**")
-    st.markdown("• Be specific and descriptive")
-    st.markdown("• Use complete phrases or sentences")
-    st.markdown("• Example: *'mindfulness meditation techniques for anxiety'* is better than just *'meditation'*")
+    st.markdown("**💡 How It Works:**")
+    st.markdown("• **Keyword matches** appear first (exact phrase in title/text)")
+    st.markdown("• **Semantic matches** fill the rest (similar meaning)")
+    st.markdown("• This ensures you never miss directly relevant content")
 
 st.header("Search")
 
 search_query = st.text_input(
-    "Describe what you're looking for (be specific for best results)",
-    placeholder="e.g., 'articles about meditation techniques for reducing anxiety' or 'INFJ relationship compatibility advice'",
+    "What are you looking for?",
+    placeholder="e.g., 'age gap relationships' or 'meditation for anxiety'",
     key="search_input"
 )
 
@@ -289,18 +342,31 @@ if st.button("Search", type="primary") and search_query:
                 st.info(f"🎯 Filtering results to include '{type_filter}' content")
             
             query_embedding = get_embedding(search_query, st.session_state.openai_client)
-            results = search_similar_blogs(st.session_state.conn, query_embedding, limit=num_results, type_filter=type_filter)
+            results = hybrid_search(st.session_state.conn, search_query, query_embedding, limit=num_results, type_filter=type_filter)
             
             if results:
-                st.success(f"Showing {len(results)} most similar articles")
+                # Count match types
+                keyword_count = sum(1 for r in results if r.get('match_type') == 'keyword')
+                semantic_count = sum(1 for r in results if r.get('match_type') == 'semantic')
+                
+                st.success(f"Found {len(results)} articles ({keyword_count} keyword matches, {semantic_count} semantic matches)")
                 
                 for idx, result in enumerate(results, 1):
                     author = extract_author_from_rss(result.get('rss_content'))
+                    match_type = result.get('match_type', 'semantic')
                     
-                    with st.expander(f"**{idx}. {result['title']}**", expanded=True):
+                    # Add badge for keyword matches
+                    title_display = result['title']
+                    if match_type == 'keyword':
+                        title_display = f"🎯 {title_display}"
+                    
+                    with st.expander(f"**{idx}. {title_display}**", expanded=True):
                         col1, col2, col3 = st.columns([2, 1, 1])
                         with col1:
-                            st.markdown(f"**Similarity Score:** {result['similarity']:.1%}")
+                            if match_type == 'keyword':
+                                st.markdown(f"**Match Type:** Keyword (exact match)")
+                            else:
+                                st.markdown(f"**Similarity Score:** {result['similarity']:.1%}")
                         with col2:
                             if result['date']:
                                 st.markdown(f"**Date:** {result['date']}")

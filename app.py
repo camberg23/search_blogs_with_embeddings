@@ -239,34 +239,129 @@ def get_stats(conn):
         ''')
         return cursor.fetchone()
 
-def generate_gap_analysis(client, search_query, results):
+def generate_gap_analysis(client, search_query, results, conn, type_filter=None):
+    """
+    Multi-step gap analysis that researches existing blog coverage first.
+    """
+    
+    # Step 1: If searching for a specific type, find what topics OTHER types have covered
+    comparative_analysis = ""
+    if type_filter:
+        # Get all MBTI types
+        all_types = ['INTJ', 'INTP', 'ENTJ', 'ENTP', 'INFJ', 'INFP', 'ENFJ', 'ENFP',
+                     'ISTJ', 'ISFJ', 'ESTJ', 'ESFJ', 'ISTP', 'ISFP', 'ESTP', 'ESFP']
+        
+        # Find topics covered for other types
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Get sample of articles for other similar types
+            other_types = [t for t in all_types if t != type_filter][:4]  # Compare to 4 similar types
+            
+            other_type_articles = []
+            for other_type in other_types:
+                cursor.execute('''
+                    SELECT title, categories
+                    FROM blogs_embeddings
+                    WHERE embedding IS NOT NULL
+                    AND (title ILIKE %s OR text ILIKE %s)
+                    ORDER BY date DESC
+                    LIMIT 10
+                ''', (f'%{other_type}%', f'%{other_type}%'))
+                
+                articles = cursor.fetchall()
+                if articles:
+                    other_type_articles.append({
+                        'type': other_type,
+                        'titles': [a['title'] for a in articles]
+                    })
+            
+            if other_type_articles:
+                comparative_analysis = "TOPICS COVERED FOR SIMILAR TYPES:\n"
+                for type_data in other_type_articles:
+                    comparative_analysis += f"\n{type_data['type']}:\n"
+                    for title in type_data['titles'][:5]:
+                        comparative_analysis += f"  - {title}\n"
+    
+    # Step 2: Analyze what broad topic categories exist in our results
     existing_titles = [r['title'] for r in results]
     existing_titles_str = "\n".join(f"- {t}" for t in existing_titles)
     
-    prompt = f"""Based on the search query "{search_query}", here are the existing blog articles we have:
+    # Step 3: Get broader context - what else exists in our blog for this general search area
+    broader_context = ""
+    with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        # Extract key terms from search query (remove common words)
+        search_terms = [word for word in search_query.lower().split() 
+                       if word not in ['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for']]
+        
+        if search_terms:
+            # Search for related articles using key terms
+            term_query = ' OR '.join([f"title ILIKE '%{term}%'" for term in search_terms[:3]])
+            cursor.execute(f'''
+                SELECT title, categories
+                FROM blogs_embeddings
+                WHERE embedding IS NOT NULL
+                AND ({term_query})
+                ORDER BY date DESC
+                LIMIT 30
+            ''')
+            
+            broader_articles = cursor.fetchall()
+            if broader_articles:
+                broader_context = f"\n\nBROADER CONTEXT - Related articles in our blog ({len(broader_articles)} found):\n"
+                for article in broader_articles[:15]:
+                    broader_context += f"  - {article['title']}\n"
+    
+    # Step 4: Generate gap analysis with all this context
+    prompt = f"""You are analyzing content gaps in a personality psychology blog.
 
+SEARCH QUERY: "{search_query}"
+
+YOUR TOP SEARCH RESULTS:
 {existing_titles_str}
 
-Please suggest 4-6 new article ideas that would fill gaps in our content coverage for this topic. These should be topics we haven't covered yet but would be valuable for readers interested in "{search_query}".
+{comparative_analysis}
 
-Format each suggestion as a potential article title, with a brief (1 sentence) explanation of why it would be valuable.
+{broader_context}
 
-Focus on:
-- Angles we haven't explored
-- Related subtopics missing from our coverage
-- Fresh perspectives on the topic
-- Practical applications we haven't addressed"""
+TASK: Suggest 4-6 specific article ideas that fill real gaps in our content.
+
+PROCESS:
+1. First, identify broad topic areas that appear for similar searches or types but are underrepresented in the top results
+2. Look for patterns - what angles do we cover repeatedly vs. what's missing?
+3. Generate specific, practical titles that address the gaps
+
+REQUIREMENTS:
+- Be SPECIFIC and PRACTICAL (not generic like "ENTP as a Parent")
+- Use NATURAL, conversational language (avoid AI phrases like "Unlocking", "Journey", "Navigate")
+- Base suggestions on actual gaps you see in the content analysis above
+- Each title should address a concrete question or problem
+
+FORMAT:
+**[Specific, natural title]**
+Gap filled: [One sentence explaining what's missing that this addresses]
+
+GOOD EXAMPLES:
+- "Why ENTPs Abandon New Hobbies After Two Weeks (And How to Actually Stick With One)"
+  Gap filled: We cover ENTP strengths but not this specific behavioral pattern many experience
+
+- "What to Do When Your INFJ Partner Needs Alone Time (A Practical Guide for Extroverts)"
+  Gap filled: We discuss INFJ traits but not concrete advice for partners navigating this
+
+BAD EXAMPLES (too generic/AI-sounding):
+- "ENTP Parenting: A Complete Guide"
+- "Unlocking Your ENTP Potential in Relationships"
+"""
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a content strategist helping identify gaps in a personality psychology blog's content. Suggest practical, engaging article ideas that would complement existing coverage."},
+            {"role": "system", "content": "You are a content strategist who analyzes content gaps based on actual data, not imagination. You write in a natural, specific style."},
             {"role": "user", "content": prompt}
         ],
+        temperature=0.7,
     )
     
     return response.choices[0].message.content
-
+    
 # Initialize connection and client
 if 'conn' not in st.session_state:
     st.session_state.conn = create_connection()
@@ -402,7 +497,13 @@ if st.button("Search", type="primary") and search_query:
                     st.subheader("💡 Suggested Topics We Haven't Covered Yet")
                     with st.spinner("Analyzing content gaps..."):
                         try:
-                            gap_ideas = generate_gap_analysis(st.session_state.openai_client, search_query, results)
+                            gap_ideas = generate_gap_analysis(
+                                                                st.session_state.openai_client, 
+                                                                search_query, 
+                                                                results, 
+                                                                st.session_state.conn,
+                                                                type_filter
+                                                            )
                             st.markdown(gap_ideas)
                         except Exception as e:
                             st.warning(f"Could not generate gap analysis: {e}")

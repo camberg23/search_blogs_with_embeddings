@@ -352,9 +352,9 @@ BAD EXAMPLES (too generic/AI-sounding):
 """
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1",
         messages=[
-            {"role": "system", "content": "You are a content strategist who analyzes content gaps based on actual data, not imagination. You write in a natural, specific style."},
+            {"role": "system", "content": "You are a content strategist who analyzes content gaps based on actual data, not just imagination. You write in a natural, specific style."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.7,
